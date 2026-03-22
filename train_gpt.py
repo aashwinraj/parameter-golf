@@ -355,7 +355,7 @@ def quantize_rowwise_int4_packed(t: Tensor) -> tuple[Tensor, Tensor]:
     clip_abs = (
         torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
         if t32.numel()
-        else torch.empty((t32.shape[0],), dtype=torch.float32)
+        else torch.empty((t32.shape[0],), dtype=torch.float32, device=t32.device)
     )
     scale = (clip_abs / PACKED_MATRIX_QUANT_MAX).clamp_min(torch.finfo(torch.float32).eps)
     q = torch.clamp(
@@ -365,7 +365,7 @@ def quantize_rowwise_int4_packed(t: Tensor) -> tuple[Tensor, Tensor]:
     ).to(torch.int16)
     nibble = (q + PACKED_MATRIX_CODE_OFFSET).to(torch.uint8)
     if nibble.shape[1] % 2 != 0:
-        pad = torch.full((nibble.shape[0], 1), PACKED_MATRIX_CODE_OFFSET, dtype=torch.uint8)
+        pad = torch.full((nibble.shape[0], 1), PACKED_MATRIX_CODE_OFFSET, dtype=torch.uint8, device=nibble.device)
         nibble = torch.cat((nibble, pad), dim=1)
     packed = nibble[:, 0::2] | (nibble[:, 1::2] << 4)
     return packed.contiguous(), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
@@ -373,15 +373,22 @@ def quantize_rowwise_int4_packed(t: Tensor) -> tuple[Tensor, Tensor]:
 def unpack_rowwise_int4_packed(packed: Tensor, cols: int) -> Tensor:
     lo = packed & 0x0F
     hi = (packed >> 4) & 0x0F
-    unpacked = torch.empty((packed.shape[0], packed.shape[1] * 2), dtype=torch.int16)
+    unpacked = torch.empty((packed.shape[0], packed.shape[1] * 2), dtype=torch.int16, device=packed.device)
     unpacked[:, 0::2] = lo.to(torch.int16)
     unpacked[:, 1::2] = hi.to(torch.int16)
     return (unpacked[:, :cols] - PACKED_MATRIX_CODE_OFFSET).contiguous()
 
 def fake_quantize_int4_rowwise_ste(w: Tensor) -> Tensor:
-    packed, scale = quantize_rowwise_int4_packed(w)
-    q = unpack_rowwise_int4_packed(packed, w.shape[1]).to(dtype=torch.float32)
-    dequant = q * scale.to(dtype=torch.float32)[:, None]
+    w32 = w.float()
+    # Keep the training-time fake-quant path torch.compile-friendly.
+    clip_abs = w32.abs().amax(dim=1)
+    scale = (clip_abs / PACKED_MATRIX_QUANT_MAX).clamp_min(torch.finfo(torch.float32).eps)
+    q = torch.clamp(
+        torch.round(torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None]) / scale[:, None]),
+        -PACKED_MATRIX_QUANT_MAX,
+        PACKED_MATRIX_QUANT_MAX,
+    )
+    dequant = q * scale[:, None]
     return w + (dequant.to(dtype=w.dtype) - w).detach()
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:

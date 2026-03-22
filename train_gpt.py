@@ -289,7 +289,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_router_query,skip_router_queries,skip_router_gate,skip_router_gates,skip_router_bias,skip_router_biases",
     ).split(",")
     if pattern
 )
@@ -771,6 +771,9 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_router_queries = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_router_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_router_bias = nn.Parameter(torch.zeros(self.num_skip_weights, self.num_skip_weights, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -797,6 +800,18 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def routed_skip(self, x: Tensor, skips: list[Tensor], decoder_idx: int) -> Tensor:
+        skip_bank = torch.stack(skips, dim=0)
+        skip_summary = F.rms_norm(skip_bank.mean(dim=2), (skip_bank.size(-1),)).permute(1, 0, 2)
+        x_summary = F.rms_norm(x.mean(dim=1), (x.size(-1),))
+        query = x_summary * self.skip_router_queries[decoder_idx].to(dtype=x.dtype)[None, :]
+        scores = (skip_summary * query[:, None, :]).sum(dim=-1)
+        scores = scores + self.skip_router_bias[decoder_idx, :skip_bank.size(0)].to(dtype=x.dtype)[None, :]
+        weights = torch.softmax(scores, dim=-1)
+        routed = (weights.transpose(0, 1)[:, :, None, None] * skip_bank).sum(dim=0)
+        gate = self.skip_router_gates[decoder_idx].to(dtype=x.dtype)[None, None, :]
+        return gate * routed
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -809,7 +824,9 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
+                routed = self.routed_skip(x, skips, i)
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = x + routed
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -959,8 +976,15 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    extra_scalar_params = (
+        base_model.skip_weights,
+        base_model.skip_router_queries,
+        base_model.skip_router_gates,
+        base_model.skip_router_bias,
+    )
+    for param in extra_scalar_params:
+        if param.numel() > 0:
+            scalar_params.append(param)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],

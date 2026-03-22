@@ -31,8 +31,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 # Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# - 10 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 3x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
@@ -61,11 +61,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -350,6 +350,9 @@ def should_keep_high_precision_tensor(name: str, last_block_idx: int | None) -> 
         and block_idx >= last_block_idx - KEEP_FLOAT_LAST_K_PROJ_COUNT + 1
     )
 
+def is_mlp_weight(name: str) -> bool:
+    return ".mlp.fc.weight" in name or ".mlp.proj.weight" in name
+
 def quantize_rowwise_int4_packed(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     clip_abs = (
@@ -414,8 +417,8 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
-    # - packed int4 for most 2D float tensors
-    # - per-tensor int8 for other float tensors
+    # - packed int4 for MLP matrices
+    # - int8 for attention and other float tensors
     # - exact passthrough for non-floats
     # - fp16/fp32 passthrough for small and sensitive tensors
     quantized: dict[str, Tensor] = {}
@@ -455,7 +458,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        if t.ndim == 2:
+        if t.ndim == 2 and is_mlp_weight(name):
             q, s = quantize_rowwise_int4_packed(t)
             qmeta[name] = {"scheme": "packed_int4_per_row", "axis": 0, "cols": int(t.shape[1])}
         else:
@@ -594,10 +597,18 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    int4_fake_quant = False
+
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         weight = self.weight
-        if self.training and FAKE_QUANT_LINEAR_ENABLED and weight.ndim == 2 and weight.numel() >= FAKE_QUANT_LINEAR_MIN_NUMEL:
+        if (
+            self.training
+            and FAKE_QUANT_LINEAR_ENABLED
+            and self.int4_fake_quant
+            and weight.ndim == 2
+            and weight.numel() >= FAKE_QUANT_LINEAR_MIN_NUMEL
+        ):
             weight = fake_quantize_int4_rowwise_ste(weight)
         return F.linear(x, weight.to(x.dtype), bias)
 
@@ -697,6 +708,8 @@ class MLP(nn.Module):
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
+        self.fc.int4_fake_quant = True
+        self.proj.int4_fake_quant = True
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:

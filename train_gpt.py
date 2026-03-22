@@ -31,8 +31,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 # Default Simple Baseline run:
-# - 10 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 3x MLP expansion
+# - 9 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
@@ -61,11 +61,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 3))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -306,15 +306,6 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-MATRIX_QUANT_BITS = int(os.environ.get("MATRIX_QUANT_BITS", 6))
-VECTOR_QUANT_BITS = int(os.environ.get("VECTOR_QUANT_BITS", 8))
-MATRIX_QUANT_MAX = (1 << (MATRIX_QUANT_BITS - 1)) - 1
-VECTOR_QUANT_MAX = (1 << (VECTOR_QUANT_BITS - 1)) - 1
-
-if not (2 <= MATRIX_QUANT_BITS <= 8):
-    raise ValueError(f"MATRIX_QUANT_BITS must be in [2, 8], got {MATRIX_QUANT_BITS}")
-if not (2 <= VECTOR_QUANT_BITS <= 8):
-    raise ValueError(f"VECTOR_QUANT_BITS must be in [2, 8], got {VECTOR_QUANT_BITS}")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -331,34 +322,27 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale. We keep them in an
-        # int8 container, but default to an int6 quantization grid to buy bytes for
-        # the larger 10-layer / 3x-MLP architecture.
+        # ranges much better than a single tensor-wide scale.
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / MATRIX_QUANT_MAX).clamp_min(1.0 / MATRIX_QUANT_MAX)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -MATRIX_QUANT_MAX, MATRIX_QUANT_MAX).to(torch.int8).contiguous()
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    # Vectors / scalars use a simpler per-tensor scale. We leave them at int8 by
-    # default because they are more sensitive and comparatively cheap.
+    # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / VECTOR_QUANT_MAX if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(
-        torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale),
-        -VECTOR_QUANT_MAX,
-        VECTOR_QUANT_MAX,
-    ).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
-    # - per-row int6-by-default for 2D float tensors stored in an int8 container
-    # - per-tensor int8-by-default for other float tensors
+    # - per-row int8 for 2D float tensors
+    # - per-tensor int8 for other float tensors
     # - exact passthrough for non-floats
     # - passthrough for small float tensors, stored as fp16 to save bytes
     quantized: dict[str, Tensor] = {}
@@ -395,14 +379,14 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["num_float_tensors"] += 1
         q, s = quantize_float_tensor(t)
         if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0, "bits": MATRIX_QUANT_BITS}
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "mixed_int6_int8_clean_per_row_v2",
+        "__quant_format__": "int8_clean_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,

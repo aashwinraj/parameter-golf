@@ -301,11 +301,25 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+KEEP_FLOAT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "KEEP_FLOAT_NAME_PATTERNS",
+        "tok_emb.weight",
+    ).split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+PACKED_MATRIX_BITS = 4
+PACKED_MATRIX_QUANT_MAX = (1 << (PACKED_MATRIX_BITS - 1)) - 1
+PACKED_MATRIX_CODE_OFFSET = PACKED_MATRIX_QUANT_MAX
+KEEP_FLOAT_LAST_K_PROJ_COUNT = int(os.environ.get("KEEP_FLOAT_LAST_K_PROJ_COUNT", 1))
+FAKE_QUANT_LINEAR_ENABLED = bool(int(os.environ.get("FAKE_QUANT_LINEAR_ENABLED", "1")))
+FAKE_QUANT_LINEAR_MIN_NUMEL = int(os.environ.get("FAKE_QUANT_LINEAR_MIN_NUMEL", str(INT8_KEEP_FLOAT_MAX_NUMEL)))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -317,6 +331,58 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
+
+def block_attn_k_weight_index(name: str) -> int | None:
+    parts = name.split(".")
+    if len(parts) == 5 and parts[0] == "blocks" and parts[2] == "attn" and parts[3] == "c_k" and parts[4] == "weight":
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
+
+def should_keep_high_precision_tensor(name: str, last_block_idx: int | None) -> bool:
+    block_idx = block_attn_k_weight_index(name)
+    return (
+        last_block_idx is not None
+        and KEEP_FLOAT_LAST_K_PROJ_COUNT > 0
+        and block_idx is not None
+        and block_idx >= last_block_idx - KEEP_FLOAT_LAST_K_PROJ_COUNT + 1
+    )
+
+def quantize_rowwise_int4_packed(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    clip_abs = (
+        torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+        if t32.numel()
+        else torch.empty((t32.shape[0],), dtype=torch.float32)
+    )
+    scale = (clip_abs / PACKED_MATRIX_QUANT_MAX).clamp_min(torch.finfo(torch.float32).eps)
+    q = torch.clamp(
+        torch.round(torch.clamp(t32, -clip_abs[:, None], clip_abs[:, None]) / scale[:, None]),
+        -PACKED_MATRIX_QUANT_MAX,
+        PACKED_MATRIX_QUANT_MAX,
+    ).to(torch.int16)
+    nibble = (q + PACKED_MATRIX_CODE_OFFSET).to(torch.uint8)
+    if nibble.shape[1] % 2 != 0:
+        pad = torch.full((nibble.shape[0], 1), PACKED_MATRIX_CODE_OFFSET, dtype=torch.uint8)
+        nibble = torch.cat((nibble, pad), dim=1)
+    packed = nibble[:, 0::2] | (nibble[:, 1::2] << 4)
+    return packed.contiguous(), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
+def unpack_rowwise_int4_packed(packed: Tensor, cols: int) -> Tensor:
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    unpacked = torch.empty((packed.shape[0], packed.shape[1] * 2), dtype=torch.int16)
+    unpacked[:, 0::2] = lo.to(torch.int16)
+    unpacked[:, 1::2] = hi.to(torch.int16)
+    return (unpacked[:, :cols] - PACKED_MATRIX_CODE_OFFSET).contiguous()
+
+def fake_quantize_int4_rowwise_ste(w: Tensor) -> Tensor:
+    packed, scale = quantize_rowwise_int4_packed(w)
+    q = unpack_rowwise_int4_packed(packed, w.shape[1]).to(dtype=torch.float32)
+    dequant = q * scale.to(dtype=torch.float32)[:, None]
+    return w + (dequant.to(dtype=w.dtype) - w).detach()
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
@@ -341,10 +407,10 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
+    # - packed int4 for most 2D float tensors
     # - per-tensor int8 for other float tensors
     # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
+    # - fp16/fp32 passthrough for small and sensitive tensors
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -355,6 +421,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,
     )
+    last_block_idx = max((idx for idx in (block_attn_k_weight_index(name) for name in state_dict) if idx is not None), default=None)
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -370,23 +437,29 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if (
+            t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL
+            or any(pattern in name for pattern in KEEP_FLOAT_NAME_PATTERNS)
+            or should_keep_high_precision_tensor(name, last_block_idx)
+        ):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        if t.ndim == 2:
+            q, s = quantize_rowwise_int4_packed(t)
+            qmeta[name] = {"scheme": "packed_int4_per_row", "axis": 0, "cols": int(t.shape[1])}
+        else:
+            q, s = quantize_float_tensor(t)
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "packed_int4_mixed_clean_v2",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -405,7 +478,13 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        scheme = qmeta.get(name, {}).get("scheme")
+        if scheme == "packed_int4_per_row":
+            cols = int(qmeta[name]["cols"])
+            s = s.to(dtype=torch.float32)
+            q_unpacked = unpack_rowwise_int4_packed(q, cols).to(dtype=torch.float32)
+            out[name] = (q_unpacked * s.view(q.shape[0], 1)).to(dtype=dtype).contiguous()
+        elif scheme == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
@@ -510,7 +589,10 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        weight = self.weight
+        if self.training and FAKE_QUANT_LINEAR_ENABLED and weight.ndim == 2 and weight.numel() >= FAKE_QUANT_LINEAR_MIN_NUMEL:
+            weight = fake_quantize_int4_rowwise_ste(weight)
+        return F.linear(x, weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:

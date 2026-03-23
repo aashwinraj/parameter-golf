@@ -92,6 +92,7 @@ class Hyperparameters:
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
+    force_fp32_linear_weights = bool(int(os.environ.get("FORCE_FP32_LINEAR_WEIGHTS", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -679,9 +680,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.q_proj_dim = dim
+        self.kv_proj_dim = kv_dim
+        # Fuse Q/K/V into one projection to reduce linear launches and memory traffic.
+        self.c_qkv = CastedLinear(dim, dim + 2 * kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -695,9 +697,11 @@ class CausalSelfAttention(nn.Module):
         v_delta: Tensor | None = None,
     ) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        qkv = self.c_qkv(x)
+        q_proj, k_proj, v_proj = qkv.split((self.q_proj_dim, self.kv_proj_dim, self.kv_proj_dim), dim=-1)
+        q = q_proj.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k_proj.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_proj.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         if q_delta is not None:
             q = q + q_delta.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2).to(dtype=q.dtype)
         if k_delta is not None:
@@ -901,9 +905,9 @@ class BatchedTTTLoRA(nn.Module):
         self.k_loras = nn.ModuleList()
         self.v_loras = nn.ModuleList()
         for block in model.blocks:
-            self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank))
-            self.k_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_k.weight.shape[0], rank))
-            self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank))
+            self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.q_proj_dim, rank))
+            self.k_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.kv_proj_dim, rank))
+            self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.kv_proj_dim, rank))
 
     def reset(self) -> None:
         for module in self.modules():
@@ -1127,8 +1131,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(True)
-    enable_math_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -1198,9 +1202,10 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
+    if args.force_fp32_linear_weights:
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -1258,6 +1263,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"force_fp32_linear_weights:{args.force_fp32_linear_weights}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "

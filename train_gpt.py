@@ -87,7 +87,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # Test-time training (LoRA) hyperparameters.
-    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 16))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
@@ -687,13 +687,21 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor, q_delta: Tensor | None = None, v_delta: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        q_delta: Tensor | None = None,
+        k_delta: Tensor | None = None,
+        v_delta: Tensor | None = None,
+    ) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         if q_delta is not None:
             q = q + q_delta.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2).to(dtype=q.dtype)
+        if k_delta is not None:
+            k = k + k_delta.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).to(dtype=k.dtype)
         if v_delta is not None:
             v = v + v_delta.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).to(dtype=v.dtype)
         q = F.rms_norm(q, (q.size(-1),))
@@ -747,13 +755,14 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, q_delta_fn=None, v_delta_fn=None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, q_delta_fn=None, k_delta_fn=None, v_delta_fn=None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = self.attn_norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
+        kd = k_delta_fn(n) if k_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
-        attn_out = self.attn(n, qd, vd)
+        attn_out = self.attn(n, qd, kd, vd)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -820,16 +829,18 @@ class GPT(nn.Module):
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             qd = lora.q_loras[i] if lora else None
+            kd = lora.k_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, qd, vd)
+            x = self.blocks[i](x, x0, qd, kd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
+            kd = lora.k_loras[bi] if lora else None
             vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, qd, vd)
+            x = self.blocks[bi](x, x0, qd, kd, vd)
 
         x = self.final_norm(x)
         targets = target_ids.reshape(-1)
@@ -887,9 +898,11 @@ class BatchedTTTLoRA(nn.Module):
         vocab = model.tok_emb.num_embeddings
         self.lm_head_lora = BatchedLinearLoRA(bsz, dim, vocab, rank)
         self.q_loras = nn.ModuleList()
+        self.k_loras = nn.ModuleList()
         self.v_loras = nn.ModuleList()
         for block in model.blocks:
             self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank))
+            self.k_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_k.weight.shape[0], rank))
             self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank))
 
     def reset(self) -> None:

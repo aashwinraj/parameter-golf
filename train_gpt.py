@@ -315,7 +315,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attnres_query,attnres_queries,attnres_gate,attnres_gates",
     ).split(",")
     if pattern
 )
@@ -775,11 +775,20 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.attnres_query = nn.Parameter(torch.randn(dim, dtype=torch.float32) * 0.02)
+        self.attnres_gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
-    def forward(self, x: Tensor, x0: Tensor, q_delta_fn=None, k_delta_fn=None, v_delta_fn=None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def depth_mix(self, history: list[Tensor]) -> Tensor:
+        values = torch.stack(history, dim=0)
+        keys = F.rms_norm(values, (values.size(-1),))
+        logits = torch.einsum("d,nbtd->nbt", self.attnres_query.to(dtype=values.dtype), keys)
+        mixed = torch.einsum("nbt,nbtd->btd", logits.softmax(dim=0), values)
+        current = history[-1]
+        gate = self.attnres_gate.to(dtype=values.dtype)[None, None, :]
+        return current + gate * (mixed - current)
+
+    def forward(self, history: list[Tensor], q_delta_fn=None, k_delta_fn=None, v_delta_fn=None) -> Tensor:
+        x = self.depth_mix(history)
         n = self.attn_norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         kd = k_delta_fn(n) if k_delta_fn is not None else None
@@ -812,10 +821,6 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -845,24 +850,13 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
+        history: list[Tensor] = [x]
+        for i, block in enumerate(self.blocks):
             qd = lora.q_loras[i] if lora else None
             kd = lora.k_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, qd, kd, vd)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            qd = lora.q_loras[bi] if lora else None
-            kd = lora.k_loras[bi] if lora else None
-            vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, qd, kd, vd)
+            x = block(history, qd, kd, vd)
+            history.append(x)
 
         x = self.final_norm(x)
         targets = target_ids.reshape(-1)
@@ -1244,8 +1238,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
